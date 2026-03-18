@@ -1,18 +1,17 @@
 <?php
-// Récupération des données envoyées par le Pico
+session_start();
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $json = file_get_contents('php://input');
     if ($json) {
-        // Sauvegarde dans data.json
-        file_put_contents('data.json', $json);
+        $_SESSION['data'] = $json;
     }
     http_response_code(200);
     echo "OK";
     exit;
 }
 
-// Lecture des données pour affichage
-$data = json_decode(file_get_contents('data.json'), true);
+$data = isset($_SESSION['data']) ? json_decode($_SESSION['data'], true) : null;
 ?>
 <!DOCTYPE html>
 <html lang="fr">
