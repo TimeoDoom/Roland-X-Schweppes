@@ -1,17 +1,17 @@
 <?php
-session_start();
+$path = '/tmp/data.json';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $json = file_get_contents('php://input');
     if ($json) {
-        $_SESSION['data'] = $json;
+        file_put_contents($path, $json);
     }
     http_response_code(200);
     echo "OK";
     exit;
 }
 
-$data = isset($_SESSION['data']) ? json_decode($_SESSION['data'], true) : null;
+$data = file_exists($path) ? json_decode(file_get_contents($path), true) : null;
 ?>
 <!DOCTYPE html>
 <html lang="fr">
