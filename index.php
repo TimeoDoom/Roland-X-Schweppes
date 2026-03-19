@@ -1,8 +1,7 @@
 <?php
-session_start();
-
 $path = '/tmp/data.json';
 
+// ── 1. POST du Pico → sauvegarde les données
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $json = file_get_contents('php://input');
     if ($json) {
@@ -13,13 +12,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     exit;
 }
 
-$data = file_exists($path) ? json_decode(file_get_contents($path), true) : null;
+// ── 2. Requête AJAX du polling JS → retourne les données en JSON
+if (isset($_GET['api'])) {
+    header('Content-Type: application/json');
+    if (file_exists($path)) {
+        echo file_get_contents($path);
+    } else {
+        echo json_encode(["swing_detecte" => false]);
+    }
+    exit;
+}
 ?>
 <!DOCTYPE html>
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="refresh" content="1">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Court Philippe-Chatrier — Roland Garros 3D</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
@@ -105,8 +112,6 @@ $data = file_exists($path) ? json_decode(file_get_contents($path), true) : null;
   .brand-name { font-family:'Bebas Neue'; font-size:20px; letter-spacing:3px; color:#F0ECE4; }
   .brand-name em { color:#D4622A; font-style:normal; }
   .brand-sub { font-size:8px; letter-spacing:3px; color:rgba(240,236,228,.28); text-transform:uppercase; }
-  .live { display:flex; align-items:center; gap:6px; font-size:9px; letter-spacing:2px; color:#3EC86A; text-transform:uppercase; font-family:'Barlow Condensed'; }
-  .live-dot { width:6px; height:6px; background:#3EC86A; border-radius:50%; animation:blink 1.4s ease-in-out infinite; box-shadow:0 0 6px #3EC86A; }
   @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.2} }
 
   /* Vignette cinématique */
@@ -277,7 +282,6 @@ $data = file_exists($path) ? json_decode(file_get_contents($path), true) : null;
       <div class="brand-sub">Roland-Garros · Paris</div>
     </div>
   </div>
-  <div class="live"><div class="live-dot"></div>LIVE</div>
 </div>
 
 <div class="hud">
@@ -2682,16 +2686,14 @@ const DOM = {
   resBar:    document.getElementById('resBar'),
 };
 
-// ── API CAPTEUR ÉLECTRONIQUE (Pico)
-// Appelée par le système externe avec les données brutes du Pico :
-// window.onPicoData({ picoId, vitesse, omega, swingDetecte })
-// Exemple : window.onPicoData({ picoId: 1, vitesse: 80.64, omega: 14.51, swingDetecte: "Oui" })
-
+// ── API CAPTEUR ÉLECTRONIQUE
+// Appelée par le système externe : onSwingDetected(true, 185.3)
 let _pendingSensorSpeed = undefined;
 
 function triggerSwing(speedKmh) {
-  if(phase!=='idle'&&phase!=='done') return;
+  if(phase!=='idle'&&phase!=='done') return; // swing déjà en cours
   _pendingSensorSpeed = speedKmh;
+  // force proportionnelle à la vitesse (normalisée 0–100 pour barre visuelle)
   force = Math.min(100, Math.max(10, Math.round((speedKmh / 230) * 100)));
   phase='wind'; phaseT=0; bounceDone=false; scoreShown=false; flashPow=0;
   trailPos.length=0; trailM.forEach(m=>m.visible=false);
@@ -2704,43 +2706,12 @@ function triggerSwing(speedKmh) {
   updateScoreboard3D('--','--','','#888');
 }
 
-window.onPicoData = function(data) {
-  // data = { picoId, vitesse, omega, swingDetecte }
-  const detected = data.swingDetecte === 'Oui' || data.swingDetecte === true;
-  if(detected) {
-    triggerSwing(data.vitesse);
+// Point d'entrée exposé au système électronique
+window.onSwingDetected = function(swingBool, speedKmh) {
+  if(swingBool === true) {
+    triggerSwing(speedKmh);
   }
 };
-
-// ── POLLING — lit data.json toutes les 500ms
-(function() {
-  let lastSwingState = false;
-
-  async function poll() {
-    try {
-      const res = await fetch('?api&_=' + Date.now());
-      const data = await res.json();
-
-      const swingDetecte = data.swing_detecte === true || data.swing_detecte === 'Oui';
-
-      // Déclenche l'animation uniquement sur front montant (Non → Oui)
-      if (swingDetecte && !lastSwingState) {
-        window.onPicoData({
-          picoId:       data.pico_id,
-          vitesse:      data.vitesse_kmh,
-          omega:        data.omega,
-          swingDetecte: 'Oui'
-        });
-      }
-      lastSwingState = swingDetecte;
-    } catch(e) {
-      // data.json pas encore dispo, on attend
-    }
-    setTimeout(poll, 500);
-  }
-
-  poll();
-})();
 
 // ── RESIZE — robuste avec debounce
 let _resizeTimer = null;
