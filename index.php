@@ -1,11 +1,15 @@
 <?php
-$path = '/tmp/data.json';
+$path = __DIR__ . '/data.json';
 
 // ── 1. POST du Pico → sauvegarde les données
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $json = file_get_contents('php://input');
+    error_log("[PICO] Données reçues : " . $json);  // log serveur
     if ($json) {
-        file_put_contents($path, $json);
+        $result = file_put_contents($path, $json);
+        error_log("[PICO] Écriture fichier : " . ($result !== false ? "OK ($result bytes)" : "ÉCHEC"));
+    } else {
+        error_log("[PICO] Body vide !");
     }
     http_response_code(200);
     echo "OK";
@@ -317,6 +321,37 @@ if (isset($_GET['api'])) {
 </div>
 
 <script>
+
+  // ── POLLING CAPTEUR + LOGS ──
+const logDiv = document.createElement('div');
+logDiv.style.cssText = 'position:fixed;top:50px;right:10px;z-index:999;background:rgba(0,0,0,0.8);color:#0f0;font:11px monospace;padding:8px;max-width:320px;max-height:300px;overflow-y:auto;border:1px solid #333;';
+document.body.appendChild(logDiv);
+
+function log(msg) {
+  const t = new Date().toLocaleTimeString();
+  logDiv.innerHTML = `<div>[${t}] ${msg}</div>` + logDiv.innerHTML;
+  console.log(`[${t}] ${msg}`);
+}
+
+log('Démarrage polling...');
+
+setInterval(async () => {
+  try {
+    const r = await fetch('?api=1&_=' + Date.now());
+    log(`HTTP ${r.status}`);
+    const data = await r.json();
+    log(`Données: ${JSON.stringify(data)}`);
+
+    if (data && data.swing_detecte === true) {
+      log(`🎾 SWING détecté ! vitesse=${data.vitesse_kmh} km/h`);
+      window.onSwingDetected(true, data.vitesse_kmh);
+    } else {
+      log(`Pas de swing (omega=${data.omega ?? '?'})`);
+    }
+  } catch(e) {
+    log(`ERREUR: ${e.message}`);
+  }
+}, 500);
 // ═══════════════════════════════════════════════════════
 //  COURT PHILIPPE-CHATRIER — Three.js r128
 // ═══════════════════════════════════════════════════════
