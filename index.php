@@ -19,6 +19,7 @@ $data = file_exists($path) ? json_decode(file_get_contents($path), true) : null;
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
+<meta http-equiv="refresh" content="1">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Court Philippe-Chatrier — Roland Garros 3D</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
