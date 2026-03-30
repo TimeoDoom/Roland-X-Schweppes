@@ -1,31 +1,190 @@
 <?php
-$path = __DIR__ . '/data.json';
+$path     = __DIR__ . '/data.json';
+$peakPath = __DIR__ . '/peak.json';  // fichier séparé pour le pic courant
 
-// ── 1. POST du Pico → sauvegarde les données
+// ── 1. POST du Pico → accumulation du pic de vitesse
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $json = file_get_contents('php://input');
-    error_log("[PICO] Données reçues : " . $json);  // log serveur
-    if ($json) {
-        $result = file_put_contents($path, $json);
-        error_log("[PICO] Écriture fichier : " . ($result !== false ? "OK ($result bytes)" : "ÉCHEC"));
-    } else {
-        error_log("[PICO] Body vide !");
+    error_log("[PICO] Données reçues : " . $json);
+    if (!$json) { error_log("[PICO] Body vide !"); http_response_code(200); echo "OK"; exit; }
+
+    $incoming = json_decode($json, true);
+    if (!$incoming) { error_log("[PICO] JSON invalide"); http_response_code(200); echo "OK"; exit; }
+
+    $vitesse  = floatval($incoming['vitesse_kmh'] ?? 0);
+    $omega    = floatval($incoming['omega'] ?? 0);
+    $swingIn  = !empty($incoming['swing_detecte']);
+    $picoId   = intval($incoming['pico_id'] ?? 0);
+
+    // Lire le pic actuel (fichier peak.json)
+    $peak = ['vitesse_kmh' => 0, 'omega' => 0, 'swing_detecte' => false, 'pico_id' => $picoId, 'consumed' => true];
+    if (file_exists($peakPath)) {
+        $p = json_decode(file_get_contents($peakPath), true);
+        if ($p) $peak = $p;
     }
+
+    // Si le JS a déjà consommé le précédent pic, on repart de zéro
+    if (!empty($peak['consumed'])) {
+        $peak = ['vitesse_kmh' => 0, 'omega' => 0, 'swing_detecte' => false, 'pico_id' => $picoId, 'consumed' => false];
+    }
+
+    // Mise à jour du pic : on garde le MAXIMUM depuis le début du swing
+    if ($swingIn) {
+        if ($vitesse > $peak['vitesse_kmh']) {
+            $peak['vitesse_kmh']   = $vitesse;
+            $peak['omega']         = $omega;
+            $peak['swing_detecte'] = true;
+            $peak['pico_id']       = $picoId;
+            $peak['consumed']      = false;
+            error_log("[PICO] Nouveau pic ! vitesse_kmh=" . $vitesse . " omega=" . $omega);
+        }
+    }
+
+    // Toujours écrire la trame brute dans data.json (pour debug)
+    file_put_contents($path, $json);
+    // Écrire le pic accumulé dans peak.json
+    $result = file_put_contents($peakPath, json_encode($peak));
+    error_log("[PICO] Pic courant : vitesse_kmh=" . $peak['vitesse_kmh'] . " swing=" . ($peak['swing_detecte']?'true':'false'));
+
     http_response_code(200);
     echo "OK";
     exit;
 }
 
-// ── 2. Requête AJAX du polling JS → retourne les données en JSON
+// ── 2. Requête AJAX du polling JS → retourne le PIC et le marque consommé
 if (isset($_GET['api'])) {
     header('Content-Type: application/json');
-    if (file_exists($path)) {
-        echo file_get_contents($path);
+    header('Cache-Control: no-store');
+
+    $peak = ['vitesse_kmh' => 0, 'swing_detecte' => false];
+    if (file_exists($peakPath)) {
+        $p = json_decode(file_get_contents($peakPath), true);
+        if ($p) $peak = $p;
+    }
+
+    // Retourner le pic uniquement s'il n'a pas encore été consommé ET qu'un swing a été détecté
+    if (!empty($peak['swing_detecte']) && empty($peak['consumed'])) {
+        echo json_encode($peak);
+        // Marquer comme consommé → le Pico pourra accumuler un nouveau pic
+        $peak['consumed'] = true;
+        $peak['swing_detecte'] = false;
+        file_put_contents($peakPath, json_encode($peak));
     } else {
-        echo json_encode(["swing_detecte" => false]);
+        echo json_encode(['swing_detecte' => false, 'vitesse_kmh' => 0]);
     }
     exit;
 }
+
+// ── 3. API Leaderboard ──────────────────────────────────────────────────────
+$lbPath   = __DIR__ . '/leaderboard.json';
+$picoPath = __DIR__ . '/picos.json';
+
+// Helper : lire un fichier JSON ou retourner un défaut
+function readJson($file, $default) {
+    if (!file_exists($file)) return $default;
+    $d = json_decode(file_get_contents($file), true);
+    return $d ?: $default;
+}
+
+// GET ?leaderboard=1  → retourne le top 20
+if (isset($_GET['leaderboard'])) {
+    header('Content-Type: application/json');
+    header('Cache-Control: no-store');
+    $lb = readJson($lbPath, []);
+    usort($lb, fn($a,$b) => $b['vitesse'] <=> $a['vitesse']);
+    echo json_encode(array_slice($lb, 0, 20));
+    exit;
+}
+
+// POST ?add_score=1  { nom, pico_id, vitesse }
+if (isset($_GET['add_score']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    header('Content-Type: application/json');
+    $body = json_decode(file_get_contents('php://input'), true) ?? [];
+    $lb = readJson($lbPath, []);
+    $lb[] = [
+        'nom'     => htmlspecialchars(substr($body['nom'] ?? 'Joueur', 0, 24)),
+        'pico_id' => intval($body['pico_id'] ?? 0),
+        'vitesse' => floatval($body['vitesse'] ?? 0),
+        'ts'      => time(),
+    ];
+    file_put_contents($lbPath, json_encode($lb));
+    echo json_encode(['ok' => true]);
+    exit;
+}
+
+// GET ?picos=1  → liste des Picos enregistrés
+if (isset($_GET['picos'])) {
+    header('Content-Type: application/json');
+    header('Cache-Control: no-store');
+    echo json_encode(readJson($picoPath, []));
+    exit;
+}
+
+// POST ?register_pico=1  { pico_id, nom, ip }
+if (isset($_GET['register_pico']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    header('Content-Type: application/json');
+    $body  = json_decode(file_get_contents('php://input'), true) ?? [];
+    $picos = readJson($picoPath, []);
+    $id    = intval($body['pico_id'] ?? 0);
+    // Mise à jour ou ajout
+    $found = false;
+    foreach ($picos as &$p) {
+        if ($p['pico_id'] === $id) {
+            $p['nom']    = htmlspecialchars(substr($body['nom'] ?? 'Pico '.$id, 0, 32));
+            $p['ip']     = $_SERVER['REMOTE_ADDR'];
+            $p['active'] = true;
+            $p['last_seen'] = time();
+            $found = true; break;
+        }
+    }
+    if (!$found) {
+        $picos[] = [
+            'pico_id'   => $id,
+            'nom'       => htmlspecialchars(substr($body['nom'] ?? 'Pico '.$id, 0, 32)),
+            'ip'        => $_SERVER['REMOTE_ADDR'],
+            'active'    => true,
+            'last_seen' => time(),
+        ];
+    }
+    file_put_contents($picoPath, json_encode($picos));
+    echo json_encode(['ok' => true]);
+    exit;
+}
+
+// POST ?toggle_pico=1  { pico_id, active }
+if (isset($_GET['toggle_pico']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    header('Content-Type: application/json');
+    $body  = json_decode(file_get_contents('php://input'), true) ?? [];
+    $picos = readJson($picoPath, []);
+    $id    = intval($body['pico_id'] ?? 0);
+    foreach ($picos as &$p) {
+        if ($p['pico_id'] === $id) { $p['active'] = (bool)($body['active'] ?? true); break; }
+    }
+    file_put_contents($picoPath, json_encode($picos));
+    echo json_encode(['ok' => true]);
+    exit;
+}
+
+// DELETE ?delete_pico=1  { pico_id }
+if (isset($_GET['delete_pico']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    header('Content-Type: application/json');
+    $body  = json_decode(file_get_contents('php://input'), true) ?? [];
+    $picos = readJson($picoPath, []);
+    $id    = intval($body['pico_id'] ?? 0);
+    $picos = array_values(array_filter($picos, fn($p) => $p['pico_id'] !== $id));
+    file_put_contents($picoPath, json_encode($picos));
+    echo json_encode(['ok' => true]);
+    exit;
+}
+
+// POST ?clear_leaderboard=1
+if (isset($_GET['clear_leaderboard']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    header('Content-Type: application/json');
+    file_put_contents($lbPath, json_encode([]));
+    echo json_encode(['ok' => true]);
+    exit;
+}
+
 ?>
 <!DOCTYPE html>
 <html lang="fr">
@@ -61,19 +220,6 @@ if (isset($_GET['api'])) {
   .stat-val { font-size:36px; line-height:1; color:#F0ECE4; transition:color .35s; }
   .stat-val.lit { color:#FFD040; text-shadow:0 0 18px rgba(255,210,40,.55); }
   .stat-lbl { font-size:9px; letter-spacing:2.5px; color:rgba(240,236,228,.28); text-transform:uppercase; margin-top:1px; }
-
-  /* Gros score central */
-  .score-center {
-    flex:0 0 auto; text-align:center; padding:0 28px;
-    border-right:1px solid rgba(255,255,255,0.08);
-  }
-  .score-big {
-    font-size:52px; line-height:1; color:#FFD040;
-    opacity:0; transform:scale(.35) translateY(4px);
-    transition:all .45s cubic-bezier(.34,1.56,.64,1);
-  }
-  .score-big.show { opacity:1; transform:scale(1) translateY(0); text-shadow:0 0 22px rgba(255,208,40,.5); }
-  .score-lbl { font-size:9px; letter-spacing:2px; color:rgba(255,208,40,.35); text-transform:uppercase; }
 
   /* Barre de force */
   .power-section {
@@ -205,13 +351,6 @@ if (isset($_GET['api'])) {
     text-transform: uppercase;
   }
 
-  .result-divider {
-    width: 1px;
-    background: rgba(255,255,255,0.08);
-    align-self: stretch;
-    margin: 8px 0;
-  }
-
   .result-verdict {
     font-size: 22px;
     letter-spacing: 8px;
@@ -225,14 +364,10 @@ if (isset($_GET['api'])) {
   .result-verdict.ace    { color:#FFD040; border-color:rgba(255,208,40,0.4); text-shadow:0 0 18px rgba(255,208,40,0.5); }
   .result-verdict.faute  { color:#E05030; border-color:rgba(224,80,48,0.4); }
   .result-verdict.service{ color:#3EC86A; border-color:rgba(62,200,106,0.4); }
-
-  .result-record {
-    font-size: 10px;
-    letter-spacing: 3px;
-    color: rgba(196,98,45,0.6);
-    text-transform: uppercase;
-  }
-  .result-record span { color: #D4622A; }
+  .result-verdict.spd-gold  { color:#FFD040; border-color:rgba(255,208,40,0.4); text-shadow:0 0 18px rgba(255,208,40,0.5); }
+  .result-verdict.spd-green { color:#3EC86A; border-color:rgba(62,200,106,0.4); text-shadow:0 0 14px rgba(62,200,106,0.4); }
+  .result-verdict.spd-blue  { color:#60D0FF; border-color:rgba(96,208,255,0.4); text-shadow:0 0 14px rgba(96,208,255,0.4); }
+  .result-verdict.spd-white { color:#F0ECE4; border-color:rgba(240,236,228,0.2); }
 
   .result-bar {
     height: 3px;
@@ -248,6 +383,338 @@ if (isset($_GET['api'])) {
     transition: width 0.9s cubic-bezier(.16,1,.3,1);
     background: linear-gradient(90deg, #3EC86A, #FFD040, #D05020);
   }
+
+  /* ═══════════════════════════════════════════════════
+     BALLE DE TENNIS — bouton menu flottant
+  ═══════════════════════════════════════════════════ */
+  #menuBtn {
+    position: fixed;
+    top: 7px;
+    right: 16px;
+    z-index: 100;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    cursor: pointer;
+    border: none;
+    background: none;
+    padding: 0;
+    transition: transform 0.25s cubic-bezier(.34,1.56,.64,1), box-shadow 0.25s;
+  }
+  #menuBtn:hover { transform: scale(1.12); }
+  #menuBtn:active { transform: scale(0.94); }
+  #menuBtn svg { display: block; width: 30px; height: 30px; }
+
+  /* Pastille rouge si pico non configuré */
+  #menuBtn .notif-dot {
+    position: absolute;
+    top: -2px; right: -2px;
+    width: 9px; height: 9px;
+    border-radius: 50%;
+    background: #E05030;
+    border: 2px solid #000;
+    display: none;
+  }
+  #menuBtn .notif-dot.show { display: block; }
+
+  /* ── Menu déroulant ── */
+  #menuPanel {
+    position: fixed;
+    top: 50px;
+    right: 16px;
+    z-index: 99;
+    background: rgba(8,6,4,0.97);
+    border: 1px solid rgba(196,98,45,0.4);
+    border-top: 2px solid #D4622A;
+    min-width: 220px;
+    box-shadow: 0 16px 48px rgba(0,0,0,0.75);
+    transform-origin: top right;
+    transform: scale(0.88) translateY(-8px);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease, transform 0.22s cubic-bezier(.34,1.56,.64,1);
+  }
+  #menuPanel.open {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+    pointer-events: auto;
+  }
+  .menu-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 20px;
+    font-family: 'Bebas Neue', sans-serif;
+    font-size: 15px;
+    letter-spacing: 3px;
+    color: rgba(240,236,228,0.7);
+    cursor: pointer;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+    transition: background 0.15s, color 0.15s;
+    text-transform: uppercase;
+    user-select: none;
+  }
+  .menu-item:last-child { border-bottom: none; }
+  .menu-item:hover { background: rgba(196,98,45,0.12); color: #F0ECE4; }
+  .menu-item svg { flex-shrink: 0; opacity: 0.55; }
+  .menu-item:hover svg { opacity: 1; }
+
+  /* ═══════════════════════════════════════════════════
+     MODALES GÉNÉRIQUES
+  ═══════════════════════════════════════════════════ */
+  .modal-bg {
+    position: fixed;
+    inset: 0;
+    z-index: 200;
+    background: rgba(0,0,0,0.72);
+    backdrop-filter: blur(4px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s ease;
+  }
+  .modal-bg.open {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .modal {
+    background: rgba(10,7,4,0.98);
+    border: 1px solid rgba(196,98,45,0.4);
+    border-top: 3px solid #D4622A;
+    width: 90vw;
+    max-width: 680px;
+    max-height: 82vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 24px 80px rgba(0,0,0,0.85);
+    transform: translateY(24px) scale(0.96);
+    transition: transform 0.3s cubic-bezier(.34,1.56,.64,1);
+  }
+  .modal-bg.open .modal { transform: translateY(0) scale(1); }
+
+  .modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 18px 24px 14px;
+    border-bottom: 1px solid rgba(255,255,255,0.07);
+    flex-shrink: 0;
+  }
+  .modal-title {
+    font-family: 'Bebas Neue', sans-serif;
+    font-size: 22px;
+    letter-spacing: 5px;
+    color: #F0ECE4;
+    text-transform: uppercase;
+  }
+  .modal-sub {
+    font-family: 'Barlow Condensed', sans-serif;
+    font-size: 11px;
+    letter-spacing: 2px;
+    color: rgba(196,98,45,0.7);
+    text-transform: uppercase;
+    margin-top: 2px;
+  }
+  .modal-close {
+    width: 32px; height: 32px;
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 2px;
+    background: none;
+    color: rgba(240,236,228,0.4);
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px;
+    transition: color 0.15s, background 0.15s;
+    font-family: sans-serif;
+  }
+  .modal-close:hover { background: rgba(196,98,45,0.18); color: #F0ECE4; }
+
+  .modal-body {
+    overflow-y: auto;
+    flex: 1;
+    padding: 20px 24px;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(196,98,45,0.3) transparent;
+  }
+
+  /* ── Leaderboard ── */
+  .lb-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: 'Bebas Neue', sans-serif;
+  }
+  .lb-table th {
+    font-size: 9px;
+    letter-spacing: 3px;
+    color: rgba(196,98,45,0.6);
+    text-transform: uppercase;
+    padding: 0 8px 10px;
+    text-align: left;
+    border-bottom: 1px solid rgba(255,255,255,0.07);
+  }
+  .lb-table th:last-child { text-align: right; }
+  .lb-table td {
+    padding: 10px 8px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    font-size: 16px;
+    letter-spacing: 2px;
+    color: rgba(240,236,228,0.65);
+  }
+  .lb-table td:last-child { text-align: right; }
+  .lb-table tr:first-child td { color: #FFD040; font-size: 20px; }
+  .lb-table tr:nth-child(2) td { color: #E0E0E0; }
+  .lb-table tr:nth-child(3) td { color: #D49060; }
+  .lb-rank { color: rgba(196,98,45,0.5) !important; font-size: 13px !important; width: 32px; }
+  .lb-speed { font-size: 22px !important; color: #FFD040 !important; }
+  .lb-table tr:nth-child(n+4) .lb-speed { color: #F0ECE4 !important; font-size: 18px !important; }
+  .lb-empty {
+    font-family: 'Barlow Condensed', sans-serif;
+    text-align: center;
+    padding: 40px;
+    color: rgba(240,236,228,0.2);
+    font-size: 14px;
+    letter-spacing: 2px;
+  }
+  .lb-footer {
+    display: flex;
+    justify-content: flex-end;
+    padding: 12px 24px 16px;
+    border-top: 1px solid rgba(255,255,255,0.06);
+    flex-shrink: 0;
+  }
+  .btn-danger {
+    font-family: 'Bebas Neue', sans-serif;
+    font-size: 13px;
+    letter-spacing: 3px;
+    padding: 8px 20px;
+    background: rgba(224,80,48,0.12);
+    border: 1px solid rgba(224,80,48,0.35);
+    color: rgba(224,80,48,0.7);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+    text-transform: uppercase;
+  }
+  .btn-danger:hover { background: rgba(224,80,48,0.25); color: #E05030; }
+
+  /* ── Pico Manager ── */
+  .pico-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 12px;
+  }
+  .pico-card {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.07);
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    transition: border-color 0.2s;
+  }
+  .pico-card.active-card { border-color: rgba(62,200,106,0.3); }
+  .pico-card-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .pico-id-badge {
+    font-family: 'Bebas Neue', sans-serif;
+    font-size: 11px;
+    letter-spacing: 2px;
+    color: rgba(196,98,45,0.7);
+    background: rgba(196,98,45,0.1);
+    padding: 2px 8px;
+    border-radius: 1px;
+  }
+  .pico-status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: rgba(255,255,255,0.15);
+    transition: background 0.2s;
+  }
+  .pico-status-dot.on { background: #3EC86A; box-shadow: 0 0 6px #3EC86A; }
+  .pico-name-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .pico-name-input {
+    flex: 1;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.09);
+    color: #F0ECE4;
+    font-family: 'Barlow Condensed', sans-serif;
+    font-size: 14px;
+    padding: 6px 10px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .pico-name-input:focus { border-color: rgba(196,98,45,0.5); }
+  .pico-name-input::placeholder { color: rgba(240,236,228,0.2); }
+  .pico-actions {
+    display: flex;
+    gap: 6px;
+  }
+  .btn-sm {
+    font-family: 'Bebas Neue', sans-serif;
+    font-size: 12px;
+    letter-spacing: 2px;
+    padding: 5px 12px;
+    background: rgba(196,98,45,0.12);
+    border: 1px solid rgba(196,98,45,0.3);
+    color: rgba(196,98,45,0.8);
+    cursor: pointer;
+    transition: background 0.15s;
+    text-transform: uppercase;
+    flex: 1;
+  }
+  .btn-sm:hover { background: rgba(196,98,45,0.25); color: #D4622A; }
+  .btn-sm.danger { background: rgba(224,80,48,0.08); border-color: rgba(224,80,48,0.25); color: rgba(224,80,48,0.6); }
+  .btn-sm.danger:hover { background: rgba(224,80,48,0.2); color: #E05030; }
+  .btn-sm.toggle-on { background: rgba(62,200,106,0.1); border-color: rgba(62,200,106,0.3); color: rgba(62,200,106,0.8); }
+  .pico-ip {
+    font-family: 'Barlow Condensed', sans-serif;
+    font-size: 11px;
+    color: rgba(240,236,228,0.2);
+    letter-spacing: 1px;
+  }
+  .pico-add-row {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 16px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid rgba(255,255,255,0.07);
+  }
+  .pico-add-row input {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.09);
+    color: #F0ECE4;
+    font-family: 'Barlow Condensed', sans-serif;
+    font-size: 14px;
+    padding: 8px 12px;
+    outline: none;
+    width: 90px;
+    transition: border-color 0.15s;
+  }
+  .pico-add-row input:focus { border-color: rgba(196,98,45,0.5); }
+  .pico-add-row input::placeholder { color: rgba(240,236,228,0.2); }
+  .pico-add-row .input-name { flex: 1; width: auto; }
+  .btn-primary {
+    font-family: 'Bebas Neue', sans-serif;
+    font-size: 13px;
+    letter-spacing: 2px;
+    padding: 8px 20px;
+    background: rgba(196,98,45,0.18);
+    border: 1px solid rgba(196,98,45,0.5);
+    color: #D4622A;
+    cursor: pointer;
+    transition: background 0.15s;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+  .btn-primary:hover { background: rgba(196,98,45,0.32); }
 
 </style>
 </head>
@@ -265,15 +732,9 @@ if (isset($_GET['api'])) {
         <div class="result-stat-val" id="resSpeed">--</div>
         <div class="result-stat-unit">km/h</div>
       </div>
-      <div class="result-divider"></div>
-      <div class="result-stat">
-        <div class="result-stat-val" id="resScore">--</div>
-        <div class="result-stat-unit">Points</div>
-      </div>
     </div>
     <div class="result-bar"><div class="result-bar-fill" id="resBar"></div></div>
     <div class="result-verdict" id="resVerdict">—</div>
-    <div class="result-record" id="resRecord"></div>
   </div>
 </div>
 
@@ -284,6 +745,95 @@ if (isset($_GET['api'])) {
     <div>
       <div class="brand-name">COURT <em>PHILIPPE-CHATRIER</em></div>
       <div class="brand-sub">Roland-Garros · Paris</div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ BALLE DE TENNIS — BOUTON MENU ═══ -->
+<button id="menuBtn" title="Menu">
+  <span class="notif-dot" id="menuNotif"></span>
+  <!-- SVG balle de tennis réaliste -->
+  <svg viewBox="0 0 30 30" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <radialGradient id="tg" cx="38%" cy="34%" r="62%">
+        <stop offset="0%" stop-color="#E8DC40"/>
+        <stop offset="55%" stop-color="#C8C018"/>
+        <stop offset="100%" stop-color="#9A9410"/>
+      </radialGradient>
+    </defs>
+    <!-- Corps de la balle -->
+    <circle cx="15" cy="15" r="14" fill="url(#tg)"/>
+    <!-- Ombre douce -->
+    <circle cx="15" cy="15" r="14" fill="none" stroke="rgba(0,0,0,0.18)" stroke-width="0.6"/>
+    <!-- Courbe gauche (feutre blanc) -->
+    <path d="M 4.5 10 Q 10 15, 4.5 20" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" opacity="0.85"/>
+    <!-- Courbe droite -->
+    <path d="M 25.5 10 Q 20 15, 25.5 20" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" opacity="0.85"/>
+    <!-- Reflet -->
+    <ellipse cx="11" cy="9" rx="3.5" ry="2" fill="rgba(255,255,255,0.22)" transform="rotate(-20,11,9)"/>
+  </svg>
+</button>
+
+<!-- ═══ MENU PANEL ═══ -->
+<div id="menuPanel">
+  <div class="menu-item" id="menuLeaderboard">
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+      <rect x="1" y="9" width="3" height="6" fill="#D4622A"/>
+      <rect x="6" y="5" width="3" height="10" fill="#D4622A"/>
+      <rect x="11" y="1" width="3" height="14" fill="#FFD040"/>
+    </svg>
+    Leaderboard
+  </div>
+  <div class="menu-item" id="menuPicos">
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+      <circle cx="5" cy="5" r="2.5" stroke="#D4622A" stroke-width="1.4"/>
+      <circle cx="11" cy="5" r="2.5" stroke="#D4622A" stroke-width="1.4"/>
+      <path d="M1 13c0-2.2 1.8-4 4-4s4 1.8 4 4" stroke="#D4622A" stroke-width="1.4" stroke-linecap="round"/>
+      <path d="M11 9c1.1 0 2 .5 2.7 1.2" stroke="#D4622A" stroke-width="1.4" stroke-linecap="round"/>
+    </svg>
+    Connexion Picos
+  </div>
+</div>
+
+<!-- ═══ MODALE LEADERBOARD ═══ -->
+<div class="modal-bg" id="lbModal">
+  <div class="modal">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title">🏆 Leaderboard</div>
+        <div class="modal-sub">Roland-Garros · Vitesse de service</div>
+      </div>
+      <button class="modal-close" id="lbClose">✕</button>
+    </div>
+    <div class="modal-body" id="lbBody">
+      <div class="lb-empty">Chargement…</div>
+    </div>
+    <div class="lb-footer">
+      <button class="btn-danger" id="lbClear">Effacer le classement</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ MODALE PICO MANAGER ═══ -->
+<div class="modal-bg" id="picoModal">
+  <div class="modal">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title">📡 Connexion Picos</div>
+        <div class="modal-sub">Gestion des 20 capteurs Raspberry Pico</div>
+      </div>
+      <button class="modal-close" id="picoClose">✕</button>
+    </div>
+    <div class="modal-body" id="picoBody">
+      <!-- Ajout rapide -->
+      <div class="pico-add-row">
+        <input type="number" id="addPicoId" min="1" max="20" placeholder="ID (1-20)">
+        <input type="text" id="addPicoNom" class="input-name" placeholder="Nom du joueur / Pico">
+        <button class="btn-primary" id="addPicoBtn">+ Ajouter</button>
+      </div>
+      <div class="pico-grid" id="picoGrid">
+        <div class="lb-empty">Chargement…</div>
+      </div>
     </div>
   </div>
 </div>
@@ -301,57 +851,15 @@ if (isset($_GET['api'])) {
     </div>
   </div>
 
-  <!-- Score central -->
-  <div class="score-center">
-    <div class="score-big" id="scoreBig">0</div>
-    <div class="score-lbl">SCORE</div>
-  </div>
-
   <!-- Barre force -->
   <div class="power-section">
     <span class="power-lbl">Force</span>
     <div class="power-track"><div class="power-fill" id="pFill"></div></div>
   </div>
-
-  <!-- Indicateur capteur -->
-  <div class="sensor-status">
-    <div class="sensor-dot"></div>
-    CAPTEUR ACTIF
-  </div>
 </div>
 
 <script>
 
-  // ── POLLING CAPTEUR + LOGS ──
-const logDiv = document.createElement('div');
-logDiv.style.cssText = 'position:fixed;top:50px;right:10px;z-index:999;background:rgba(0,0,0,0.8);color:#0f0;font:11px monospace;padding:8px;max-width:320px;max-height:300px;overflow-y:auto;border:1px solid #333;';
-document.body.appendChild(logDiv);
-
-function log(msg) {
-  const t = new Date().toLocaleTimeString();
-  logDiv.innerHTML = `<div>[${t}] ${msg}</div>` + logDiv.innerHTML;
-  console.log(`[${t}] ${msg}`);
-}
-
-log('Démarrage polling...');
-
-setInterval(async () => {
-  try {
-    const r = await fetch('?api=1&_=' + Date.now());
-    log(`HTTP ${r.status}`);
-    const data = await r.json();
-    log(`Données: ${JSON.stringify(data)}`);
-
-    if (data && data.swing_detecte === true) {
-      log(`🎾 SWING détecté ! vitesse=${data.vitesse_kmh} km/h`);
-      window.onSwingDetected(true, data.vitesse_kmh);
-    } else {
-      log(`Pas de swing (omega=${data.omega ?? '?'})`);
-    }
-  } catch(e) {
-    log(`ERREUR: ${e.message}`);
-  }
-}, 500);
 // ═══════════════════════════════════════════════════════
 //  COURT PHILIPPE-CHATRIER — Three.js r128
 // ═══════════════════════════════════════════════════════
@@ -1805,7 +2313,26 @@ for(let i=0;i<5;i++) addBanner(schwTex,  14.4, 4.5, -10+i*5, -Math.PI/2, 5.2, 1.
 const scoreboardCanvas = document.createElement('canvas');
 scoreboardCanvas.width = 1024; scoreboardCanvas.height = 512;
 
-function drawScoreboard(cv, speedVal, scoreVal, verdictVal, rankColor) {
+function getVerdictColor(speed) {
+  if(speed >= 200) return '#FFD040';
+  if(speed >= 170) return '#FFA030';
+  if(speed >= 140) return '#3EC86A';
+  if(speed >= 110) return '#60D0FF';
+  return '#F0ECE4';
+}
+
+function getVerdictMsg(speed) {
+  if(speed >= 210) return 'BOMBE ! 💥';
+  if(speed >= 190) return 'FULGURANT !';
+  if(speed >= 175) return 'EXPLOSIF !';
+  if(speed >= 160) return 'EXCELLENT !';
+  if(speed >= 145) return 'TRÈS BIEN !';
+  if(speed >= 130) return 'BIEN JOUÉ !';
+  if(speed >= 110) return 'EN PUISSANCE';
+  return 'BONNE BALLE !';
+}
+
+function drawScoreboard(cv, speedVal, verdictVal) {
   const cx = cv.getContext('2d');
   const W = cv.width, H = cv.height;
   cx.clearRect(0,0,W,H);
@@ -1844,66 +2371,51 @@ function drawScoreboard(cv, speedVal, scoreVal, verdictVal, rankColor) {
     cx.fillRect(px, 150, 6, 4);
   }
 
-  // ── Zone principale : vitesse | séparateur | score
-  const col1 = W*0.25, col2 = W*0.75;
-
-  // Labels
+  // ── Label VITESSE centré
   cx.font='bold 28px monospace';
-  cx.fillStyle='rgba(245,200,140,0.38)'; cx.textBaseline='middle';
-  cx.textAlign='center';
-  cx.fillText('VITESSE', col1, 185);
-  cx.fillText('SCORE',   col2, 185);
+  cx.fillStyle='rgba(245,200,140,0.38)'; cx.textBaseline='middle'; cx.textAlign='center';
+  cx.fillText('VITESSE', W/2, 190);
 
-  // Séparateur vertical central
-  cx.strokeStyle='rgba(196,98,45,0.25)'; cx.lineWidth=2;
-  cx.beginPath(); cx.moveTo(W/2, 160); cx.lineTo(W/2, 360); cx.stroke();
+  // ── Valeur LED géante centrée
+  cx.font='bold 190px "Bebas Neue",monospace';
+  cx.textAlign='center'; cx.textBaseline='middle';
+  if(speedVal !== '--') {
+    cx.fillStyle='#FFD060'; cx.shadowColor='#FFA010'; cx.shadowBlur=40;
+    cx.fillText(speedVal, W/2, 285);
+    cx.shadowBlur=20; cx.fillText(speedVal, W/2, 285);
+  } else {
+    cx.fillStyle='rgba(245,200,140,0.15)';
+    cx.fillText('--', W/2, 285);
+  }
+  cx.shadowBlur=0;
 
-  // Valeurs LED géantes
-  const led = (txt, x, color, glow) => {
-    cx.font='bold 160px "Bebas Neue",monospace';
-    cx.textAlign='center'; cx.textBaseline='middle';
-    cx.fillStyle=color;
-    if(glow){ cx.shadowColor=glow; cx.shadowBlur=40; }
-    cx.fillText(txt, x, 270);
-    if(glow){ cx.shadowBlur=20; cx.fillText(txt, x, 270); }
-    cx.shadowBlur=0;
-  };
-
-  const dim = 'rgba(245,200,140,0.15)';
-  led(speedVal==='--'?'--':speedVal, col1, speedVal==='--'?dim:'#FFD060', speedVal==='--'?null:'#FFA010');
-  led(scoreVal==='--'?'--':scoreVal, col2, scoreVal==='--'?dim:'#FFD060', scoreVal==='--'?null:'#FFA010');
-
-  // Unités sous les valeurs
-  cx.font='bold 26px monospace'; cx.fillStyle='rgba(245,200,140,0.32)';
-  cx.textBaseline='middle';
-  cx.fillText('km/h', col1, 360);
-  cx.fillText('pts',  col2, 360);
+  // Unité km/h centrée
+  cx.font='bold 28px monospace'; cx.fillStyle='rgba(245,200,140,0.32)';
+  cx.textBaseline='middle'; cx.textAlign='center';
+  cx.fillText('km/h', W/2, 390);
 
   // Séparateur bas
   for(let px=30; px<W-30; px+=10) {
     cx.fillStyle=px%20===0 ? 'rgba(196,98,45,0.6)' : 'rgba(196,98,45,0.18)';
-    cx.fillRect(px, 382, 6, 4);
+    cx.fillRect(px, 412, 6, 4);
   }
 
-  // ── Verdict / footer
+  // ── Message / footer
   if(verdictVal && verdictVal !== '') {
-    // Fond verdict
-    const vColors = { 'ACE !':'#FFD040', 'SERVICE !':'#3EC86A', 'FAUTE':'#E05030', 'EN JEU':'#F0ECE4' };
-    const vc = vColors[verdictVal] || '#F0ECE4';
-    cx.font='bold 72px "Bebas Neue",Arial Narrow,sans-serif';
+    const msgColor = speedVal !== '--' ? getVerdictColor(parseInt(speedVal)) : '#F0ECE4';
+    cx.font='bold 58px "Bebas Neue",Arial Narrow,sans-serif';
     cx.textAlign='center'; cx.textBaseline='middle';
-    cx.fillStyle=vc;
-    cx.shadowColor=vc; cx.shadowBlur=30;
-    cx.fillText(verdictVal, W/2, 450);
+    cx.fillStyle=msgColor; cx.shadowColor=msgColor; cx.shadowBlur=28;
+    cx.fillText(verdictVal, W/2, 464);
     cx.shadowBlur=0;
   } else {
     cx.font='italic 24px monospace';
     cx.fillStyle='rgba(245,200,140,0.22)'; cx.textAlign='center'; cx.textBaseline='middle';
-    cx.fillText(speedVal==='--' ? '▶  APPUYER SUR SERVIR  ◀' : '◀  PROCHAIN SERVICE  ▶', W/2, 450);
+    cx.fillText(speedVal==='--' ? '▶  PRÊT À SERVIR  ◀' : '◀  PROCHAIN SERVICE  ▶', W/2, 464);
   }
 }
 
-drawScoreboard(scoreboardCanvas, '--', '--', '', '#888');
+drawScoreboard(scoreboardCanvas, '--', '');
 const scoreboardTex3D = new THREE.CanvasTexture(scoreboardCanvas);
 
 const scoreboardMesh = new THREE.Mesh(
@@ -1923,8 +2435,8 @@ sbFrame.position.set(0, 13, -16.2); scene.add(sbFrame);
 });
 
 // Fonction de mise à jour du scoreboard 3D
-function updateScoreboard3D(speed, score, rank, rankColor) {
-  drawScoreboard(scoreboardCanvas, speed, score, rank, rankColor);
+function updateScoreboard3D(speed, verdict) {
+  drawScoreboard(scoreboardCanvas, speed, verdict);
   scoreboardTex3D.needsUpdate = true;
 }
 
@@ -2276,7 +2788,7 @@ let phase='idle', phaseT=0;
 const PDUR={wind:.61,toss:.51,swing:.40,ballfly:.91,bounce:.57,done:999};
 const PORD=['idle','wind','toss','swing','ballfly','bounce','done'];
 
-let force=62, bestScore=0;
+let force=62;
 let bounceDone=false, scoreShown=false, flashPow=0;
 
 // ── POINTS DE TRAJECTOIRE (world space, joueur en -1.2,0,14.8 scale 1.32)
@@ -2663,48 +3175,34 @@ function animate(ts){
 function showScore(sensorSpeed){
   if(scoreShown) return; scoreShown=true;
   const speed = sensorSpeed !== undefined ? Math.round(sensorSpeed) : Math.round(85+force*1.35+(Math.random()*20-10));
-  const score=Math.round(force*9.3+Math.random()*55);
   DOM.hSpeed.textContent=speed; DOM.hSpeed.classList.add('lit');
   DOM.pFill.style.width=force+'%';
 
-  // Calcul verdict
-  const isAce   = score >= 90;
-  const isFaute = speed < 100;
-  const verdict = isAce ? 'ACE !' : isFaute ? 'FAUTE' : score >= 70 ? 'SERVICE !' : 'EN JEU';
-  const vColor  = isAce ? '#FFD040' : isFaute ? '#E05030' : '#3EC86A';
+  const msg = getVerdictMsg(speed);
 
-  // Scoreboard 3D : vitesse d'abord
-  updateScoreboard3D(speed+'', '--', '', '#FFD060');
+  // Scoreboard 3D : vitesse d'abord, message après
+  updateScoreboard3D(speed+'', '');
 
   setTimeout(()=>{
-    DOM.scoreBig.textContent=score; DOM.scoreBig.classList.add('show');
-    if(score>bestScore) bestScore=score;
-    DOM.hBest.textContent=bestScore;
-  },350);
-
-  // Scoreboard 3D : score + verdict après 600ms
-  setTimeout(()=>{
-    updateScoreboard3D(speed+'', score+'', verdict, vColor);
+    updateScoreboard3D(speed+'', msg);
   }, 600);
 
   // ── Overlay résultat ──
   setTimeout(()=>{
-    const verdictClass = isAce ? 'ace' : isFaute ? 'faute' : 'service';
-    const scoreColor   = isAce ? 'green' : isFaute ? 'red' : '';
-
     DOM.resSpeed.textContent = speed;
-    DOM.resScore.textContent = score;
-    DOM.resScore.className = 'result-stat-val ' + scoreColor;
-    DOM.resVerdict.textContent = verdict;
-    DOM.resVerdict.className = 'result-verdict ' + verdictClass;
-    DOM.resRecord.innerHTML = score > bestScore
-      ? '🏆 Nouveau record !'
-      : 'Record · <span>' + bestScore + ' pts</span>';
+    DOM.resVerdict.textContent = msg;
+    DOM.resVerdict.className = 'result-verdict spd-' + (speed >= 190 ? 'gold' : speed >= 150 ? 'green' : speed >= 110 ? 'blue' : 'white');
 
+    _overlayShowing = true;
     DOM.overlay.classList.add('show');
     requestAnimationFrame(()=>{ DOM.resBar.style.width = force + '%'; });
-    setTimeout(()=>{ DOM.overlay.classList.remove('show'); }, 3000);
+    setTimeout(()=>{
+      DOM.overlay.classList.remove('show');
+      _overlayShowing = false; // pop-up fermée → nouveau swing autorisé
+    }, 3000);
   }, 900);
+  // ── Enregistrer au leaderboard si un nom de joueur est connu
+  _saveScoreToLeaderboard(speed);
 }
 
 // ── Références DOM cachées
@@ -2712,20 +3210,19 @@ const DOM = {
   hSpeed:    document.getElementById('hSpeed'),
   hBest:     document.getElementById('hBest'),
   pFill:     document.getElementById('pFill'),
-  scoreBig:  document.getElementById('scoreBig'),
   overlay:   document.getElementById('resultOverlay'),
   resSpeed:  document.getElementById('resSpeed'),
-  resScore:  document.getElementById('resScore'),
   resVerdict:document.getElementById('resVerdict'),
-  resRecord: document.getElementById('resRecord'),
   resBar:    document.getElementById('resBar'),
 };
 
 // ── API CAPTEUR ÉLECTRONIQUE
 // Appelée par le système externe : onSwingDetected(true, 185.3)
 let _pendingSensorSpeed = undefined;
+let _overlayShowing = false; // verrou : bloque tout nouveau swing tant que la pop-up est visible
 
 function triggerSwing(speedKmh) {
+  if(_overlayShowing) return;                // pop-up score encore affichée → on attend
   if(phase!=='idle'&&phase!=='done') return; // swing déjà en cours
   _pendingSensorSpeed = speedKmh;
   // force proportionnelle à la vitesse (normalisée 0–100 pour barre visuelle)
@@ -2733,12 +3230,11 @@ function triggerSwing(speedKmh) {
   phase='wind'; phaseT=0; bounceDone=false; scoreShown=false; flashPow=0;
   trailPos.length=0; trailM.forEach(m=>m.visible=false);
   dustMeshes.length=0; dustPool.forEach(m=>{m.visible=false;});
-  DOM.scoreBig.classList.remove('show');
   DOM.hSpeed.classList.remove('lit');
   DOM.overlay.classList.remove('show');
   DOM.pFill.style.width='0%';
   DOM.hSpeed.textContent='--';
-  updateScoreboard3D('--','--','','#888');
+  updateScoreboard3D('--','');
 }
 
 // Point d'entrée exposé au système électronique
@@ -2763,6 +3259,251 @@ function onResize(){
 window.addEventListener('resize', onResize, { passive: true });
 
 animate(0);
+
+// ── POLLING CAPTEUR ────────────────────────────────────
+// Stratégie : polling rapide (150ms) pour ne pas rater le pic.
+// Le PHP accumule le maximum sur toute la durée du swing côté serveur,
+// donc même si on poll un peu après le pic, on récupère bien le MAX.
+let _polling = false;
+let _sessionBestKmh = 0;  // meilleur pic de la session
+
+setInterval(async () => {
+  if (_polling) return;   // éviter les requêtes qui se chevauchent
+  _polling = true;
+  try {
+    const r = await fetch('?api=1&_=' + Date.now());
+    if (!r.ok) { return; }
+    const data = await r.json();
+
+    if (data && data.swing_detecte && data.vitesse_kmh > 0) {
+      const kmh = parseFloat(data.vitesse_kmh);
+      if (kmh > _sessionBestKmh) _sessionBestKmh = kmh;
+      window.onSwingDetected(true, kmh);
+    }
+  } catch(e) {
+    // silencieux
+  } finally {
+    _polling = false;
+  }
+}, 150);  // ← 150ms au lieu de 500ms
+
+// ════════════════════════════════════════════════════════
+//  MENU BALLE DE TENNIS + LEADERBOARD + PICO MANAGER
+// ════════════════════════════════════════════════════════
+
+// ── Nom joueur courant (pour le leaderboard) ──
+let _currentPlayerName = 'Joueur';
+let _currentPicoId = 0;
+
+async function _saveScoreToLeaderboard(speed) {
+  try {
+    await fetch('?add_score=1', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nom: _currentPlayerName, pico_id: _currentPicoId, vitesse: speed })
+    });
+  } catch(e) {}
+}
+
+// ── Helpers UI ──
+function openModal(id)  { document.getElementById(id).classList.add('open'); }
+function closeModal(id) { document.getElementById(id).classList.remove('open'); }
+
+// Fermer en cliquant sur le fond
+document.querySelectorAll('.modal-bg').forEach(bg => {
+  bg.addEventListener('click', e => { if(e.target === bg) bg.classList.remove('open'); });
+});
+
+// ── Bouton balle menu ──
+const menuBtn   = document.getElementById('menuBtn');
+const menuPanel = document.getElementById('menuPanel');
+let menuOpen = false;
+
+function toggleMenu() {
+  menuOpen = !menuOpen;
+  menuPanel.classList.toggle('open', menuOpen);
+}
+menuBtn.addEventListener('click', e => { e.stopPropagation(); toggleMenu(); });
+document.addEventListener('click', () => { if(menuOpen){ menuOpen=false; menuPanel.classList.remove('open'); } });
+menuPanel.addEventListener('click', e => e.stopPropagation());
+
+// ── Item : Leaderboard ──
+document.getElementById('menuLeaderboard').addEventListener('click', () => {
+  toggleMenu();
+  openModal('lbModal');
+  loadLeaderboard();
+});
+document.getElementById('lbClose').addEventListener('click', () => closeModal('lbModal'));
+document.getElementById('lbClear').addEventListener('click', async () => {
+  if(!confirm('Effacer tout le classement ?')) return;
+  await fetch('?clear_leaderboard=1', { method: 'POST' });
+  loadLeaderboard();
+});
+
+async function loadLeaderboard() {
+  const body = document.getElementById('lbBody');
+  body.innerHTML = '<div class="lb-empty">Chargement…</div>';
+  try {
+    const r = await fetch('?leaderboard=1&_='+Date.now());
+    const lb = await r.json();
+    if (!lb.length) { body.innerHTML = '<div class="lb-empty">Aucun score enregistré</div>'; return; }
+    const medals = ['🥇','🥈','🥉'];
+    const rows = lb.map((e, i) => {
+      const spd = Math.round(e.vitesse);
+      const spdClass = spd >= 190 ? 'spd-gold' : spd >= 150 ? '' : '';
+      const medal = medals[i] || '';
+      const date = new Date(e.ts * 1000).toLocaleDateString('fr-FR', { day:'2-digit', month:'2-digit' });
+      return `<tr>
+        <td class="lb-rank">${medal || (i+1)}</td>
+        <td>${e.nom || 'Joueur'}</td>
+        <td style="color:rgba(196,98,45,0.45);font-size:11px;letter-spacing:1px">P${e.pico_id||'?'}</td>
+        <td style="font-size:10px;color:rgba(240,236,228,0.2)">${date}</td>
+        <td class="lb-speed">${spd} <span style="font-size:11px;color:rgba(240,236,228,0.3)">km/h</span></td>
+      </tr>`;
+    }).join('');
+    body.innerHTML = `<table class="lb-table">
+      <thead><tr>
+        <th>#</th><th>Joueur</th><th>Pico</th><th>Date</th><th style="text-align:right">Vitesse</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+  } catch(e) {
+    body.innerHTML = '<div class="lb-empty">Erreur de chargement</div>';
+  }
+}
+
+// ── Item : Pico Manager ──
+document.getElementById('menuPicos').addEventListener('click', () => {
+  toggleMenu();
+  openModal('picoModal');
+  loadPicos();
+});
+document.getElementById('picoClose').addEventListener('click', () => closeModal('picoModal'));
+
+async function loadPicos() {
+  const grid = document.getElementById('picoGrid');
+  grid.innerHTML = '<div class="lb-empty">Chargement…</div>';
+  try {
+    const r = await fetch('?picos=1&_='+Date.now());
+    const picos = await r.json();
+    document.getElementById('menuNotif').classList.toggle('show', picos.length === 0);
+    if (!picos.length) {
+      grid.innerHTML = '<div class="lb-empty">Aucun Pico enregistré. Ajoutez-en ci-dessus.</div>';
+      return;
+    }
+    const now = Math.floor(Date.now()/1000);
+    grid.innerHTML = picos.map(p => {
+      const online = (now - (p.last_seen||0)) < 30; // actif si vu il y a < 30s
+      const activeClass = p.active ? 'active-card' : '';
+      const dotClass = online ? 'on' : '';
+      const toggleLabel = p.active ? 'Désactiver' : 'Activer';
+      const toggleClass = p.active ? 'toggle-on' : '';
+      return `<div class="pico-card ${activeClass}" data-id="${p.pico_id}">
+        <div class="pico-card-top">
+          <span class="pico-id-badge">Pico ${p.pico_id}</span>
+          <span class="pico-status-dot ${dotClass}" title="${online?'En ligne':'Hors ligne'}"></span>
+        </div>
+        <div class="pico-name-row">
+          <input class="pico-name-input" type="text" value="${p.nom||''}" placeholder="Nom du joueur" data-orig="${p.nom||''}">
+        </div>
+        <div class="pico-ip">IP : ${p.ip||'—'} · Vu : ${online?'maintenant':_timeAgo(p.last_seen)}</div>
+        <div class="pico-actions">
+          <button class="btn-sm ${toggleClass}" onclick="togglePico(${p.pico_id}, ${!p.active})">${toggleLabel}</button>
+          <button class="btn-sm" onclick="savePicoName(${p.pico_id}, this)">Sauver</button>
+          <button class="btn-sm danger" onclick="deletePico(${p.pico_id})">Suppr</button>
+        </div>
+      </div>`;
+    }).join('');
+  } catch(e) {
+    grid.innerHTML = '<div class="lb-empty">Erreur de chargement</div>';
+  }
+}
+
+function _timeAgo(ts) {
+  if(!ts) return '—';
+  const s = Math.floor(Date.now()/1000) - ts;
+  if(s < 60) return s+'s';
+  if(s < 3600) return Math.floor(s/60)+'min';
+  return Math.floor(s/3600)+'h';
+}
+
+async function savePicoName(id, btn) {
+  const card = btn.closest('.pico-card');
+  const nom = card.querySelector('.pico-name-input').value.trim() || 'Pico '+id;
+  await fetch('?register_pico=1', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ pico_id: id, nom })
+  });
+  loadPicos();
+  // Si c'est le Pico actif courant, on met à jour le nom
+  if(id === _currentPicoId) _currentPlayerName = nom;
+}
+
+async function togglePico(id, active) {
+  await fetch('?toggle_pico=1', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ pico_id: id, active })
+  });
+  loadPicos();
+}
+
+async function deletePico(id) {
+  if(!confirm('Supprimer Pico '+id+' ?')) return;
+  await fetch('?delete_pico=1', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ pico_id: id })
+  });
+  loadPicos();
+}
+
+// ── Ajout rapide d'un Pico ──
+document.getElementById('addPicoBtn').addEventListener('click', async () => {
+  const idEl  = document.getElementById('addPicoId');
+  const nomEl = document.getElementById('addPicoNom');
+  const id    = parseInt(idEl.value);
+  const nom   = nomEl.value.trim() || 'Pico '+id;
+  if(!id || id < 1 || id > 20) { idEl.style.borderColor='#E05030'; return; }
+  idEl.style.borderColor='';
+  await fetch('?register_pico=1', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ pico_id: id, nom })
+  });
+  idEl.value = ''; nomEl.value = '';
+  loadPicos();
+});
+
+// Mettre le nom du joueur courant depuis le polling (pico_id reçu)
+const _origOnSwingDetected = window.onSwingDetected;
+window.onSwingDetected = async function(swingBool, speedKmh, picoId) {
+  if(picoId !== undefined) {
+    _currentPicoId = picoId;
+    // Récupérer le nom associé
+    try {
+      const r = await fetch('?picos=1&_='+Date.now());
+      const picos = await r.json();
+      const p = picos.find(x => x.pico_id === picoId);
+      if(p) _currentPlayerName = p.nom || 'Joueur';
+    } catch(e) {}
+  }
+  _origOnSwingDetected(swingBool, speedKmh);
+};
+
+// Transmettre le pico_id depuis le polling
+const _origInterval = setInterval; // déjà lancé plus haut, on patch onSwingDetected dans le polling
+// Patch post-hoc : le polling appelle window.onSwingDetected(true, kmh) — on enrichit avec pico_id depuis data
+// (le polling existant passe déjà data.pico_id via la var data, on le récupère ici)
+// On redéfinit proprement l'appel dans le polling via un second patch :
+(function(){
+  // Le polling existant utilise window.onSwingDetected(true, kmh).
+  // On intercepte les données brutes depuis le flag global _lastPicoData.
+  const _origTrigger = triggerSwing;
+  window._patchedPicoId = 0;
+  window.triggerSwingWithPico = function(kmh, picoId) {
+    _currentPicoId = picoId || 0;
+    _origTrigger(kmh);
+  };
+})();
+
 </script>
 </body>
 </html>
