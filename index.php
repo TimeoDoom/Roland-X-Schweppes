@@ -1,74 +1,181 @@
 <?php
-$path     = __DIR__ . '/data.json';
-$peakPath = __DIR__ . '/peak.json';  // fichier séparé pour le pic courant
+// ════════════════════════════════════════════════════════════════════════════
+//  BACKEND MULTI-PICO — index.php
+//
+//  Architecture :
+//    • Un fichier  peak_{pico_id}.json  par Pico  (isolation totale des données)
+//    • Modèle TTL (time-to-live) : le pic reste lisible par TOUS les clients
+//      pendant PEAK_TTL secondes depuis sa détection, puis expire.
+//      → Plus de flag "consumed" destructif : le 1er client à poller ne vole
+//        plus le pic aux autres.
+//    • Verrouillage fichier (LOCK_EX / LOCK_SH) pour éviter les race conditions
+//      entre plusieurs Picos qui écriraient en même temps.
+//    • data_{pico_id}.json gardé pour debug (trame brute la plus récente).
+// ════════════════════════════════════════════════════════════════════════════
 
-// ── 1. POST du Pico → accumulation du pic de vitesse
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+define('PEAK_TTL',    8);   // secondes pendant lesquelles un pic est "visible"
+define('DATA_DIR',  __DIR__);
+
+// ── Helpers fichier JSON avec verrou ────────────────────────────────────────
+
+function peakPath(int $id): string {
+    return DATA_DIR . '/peak_' . $id . '.json';
+}
+
+/**
+ * Lit le fichier JSON d'un Pico avec verrou partagé (lecture).
+ * Retourne un tableau associatif ou $default si le fichier est absent/invalide.
+ */
+function readPeakLocked(int $id, array $default = []): array {
+    $path = peakPath($id);
+    if (!file_exists($path)) return $default;
+    $fp = fopen($path, 'r');
+    if (!$fp) return $default;
+    flock($fp, LOCK_SH);
+    $raw = stream_get_contents($fp);
+    flock($fp, LOCK_UN);
+    fclose($fp);
+    $data = json_decode($raw, true);
+    return is_array($data) ? $data : $default;
+}
+
+/**
+ * Écrit le fichier JSON d'un Pico avec verrou exclusif (écriture atomique).
+ */
+function writePeakLocked(int $id, array $data): void {
+    $path = peakPath($id);
+    $fp = fopen($path, 'c+');   // crée si absent, ne tronque pas d'abord
+    if (!$fp) return;
+    flock($fp, LOCK_EX);
+    ftruncate($fp, 0);
+    rewind($fp);
+    fwrite($fp, json_encode($data));
+    flock($fp, LOCK_UN);
+    fclose($fp);
+}
+
+// ── 1. POST du Pico → accumulation du pic de vitesse ────────────────────────
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_GET['add_score'])
+    && !isset($_GET['register_pico']) && !isset($_GET['toggle_pico'])
+    && !isset($_GET['delete_pico'])   && !isset($_GET['clear_leaderboard'])) {
+
     $json = file_get_contents('php://input');
-    error_log("[PICO] Données reçues : " . $json);
-    if (!$json) { error_log("[PICO] Body vide !"); http_response_code(200); echo "OK"; exit; }
+    if (!$json) { http_response_code(200); echo "OK"; exit; }
 
     $incoming = json_decode($json, true);
-    if (!$incoming) { error_log("[PICO] JSON invalide"); http_response_code(200); echo "OK"; exit; }
+    if (!$incoming) { http_response_code(200); echo "OK"; exit; }
 
-    $vitesse  = floatval($incoming['vitesse_kmh'] ?? 0);
-    $omega    = floatval($incoming['omega'] ?? 0);
-    $swingIn  = !empty($incoming['swing_detecte']);
-    $picoId   = intval($incoming['pico_id'] ?? 0);
+    $vitesse = floatval($incoming['vitesse_kmh'] ?? 0);
+    $omega   = floatval($incoming['omega'] ?? 0);
+    $swingIn = !empty($incoming['swing_detecte']);
+    $picoId  = max(0, intval($incoming['pico_id'] ?? 0));
 
-    // Lire le pic actuel (fichier peak.json)
-    $peak = ['vitesse_kmh' => 0, 'omega' => 0, 'swing_detecte' => false, 'pico_id' => $picoId, 'consumed' => true];
-    if (file_exists($peakPath)) {
-        $p = json_decode(file_get_contents($peakPath), true);
-        if ($p) $peak = $p;
+    $now  = time();
+    $peak = readPeakLocked($picoId, [
+        'vitesse_kmh'   => 0,
+        'omega'         => 0,
+        'swing_detecte' => false,
+        'pico_id'       => $picoId,
+        'expires_at'    => 0,
+    ]);
+
+    // Si le TTL du précédent pic est écoulé, on repart d'un état vierge
+    if ($now >= ($peak['expires_at'] ?? 0)) {
+        $peak = [
+            'vitesse_kmh'   => 0,
+            'omega'         => 0,
+            'swing_detecte' => false,
+            'pico_id'       => $picoId,
+            'expires_at'    => 0,
+        ];
     }
 
-    // Si le JS a déjà consommé le précédent pic, on repart de zéro
-    if (!empty($peak['consumed'])) {
-        $peak = ['vitesse_kmh' => 0, 'omega' => 0, 'swing_detecte' => false, 'pico_id' => $picoId, 'consumed' => false];
+    // Accumulation du maximum sur toute la durée du swing
+    if ($swingIn && $vitesse > $peak['vitesse_kmh']) {
+        $peak['vitesse_kmh']   = $vitesse;
+        $peak['omega']         = $omega;
+        $peak['swing_detecte'] = true;
+        $peak['pico_id']       = $picoId;
+        $peak['expires_at']    = $now + PEAK_TTL;  // remet le compteur TTL
+        error_log("[PICO $picoId] Nouveau pic : {$vitesse} km/h — expire dans " . PEAK_TTL . "s");
     }
 
-    // Mise à jour du pic : on garde le MAXIMUM depuis le début du swing
-    if ($swingIn) {
-        if ($vitesse > $peak['vitesse_kmh']) {
-            $peak['vitesse_kmh']   = $vitesse;
-            $peak['omega']         = $omega;
-            $peak['swing_detecte'] = true;
-            $peak['pico_id']       = $picoId;
-            $peak['consumed']      = false;
-            error_log("[PICO] Nouveau pic ! vitesse_kmh=" . $vitesse . " omega=" . $omega);
+    writePeakLocked($picoId, $peak);
+
+    // Trame brute pour debug
+    file_put_contents(DATA_DIR . '/data_' . $picoId . '.json', $json);
+
+    // Mise à jour automatique de last_seen dans picos.json (pour le dot "online")
+    $picoPath2 = DATA_DIR . '/picos.json';
+    $fp2 = fopen($picoPath2, 'c+');
+    if ($fp2) {
+        flock($fp2, LOCK_EX);
+        $raw2  = stream_get_contents($fp2);
+        $picos = json_decode($raw2, true);
+        if (!is_array($picos)) $picos = [];
+        $found = false;
+        foreach ($picos as &$p) {
+            if (($p['pico_id'] ?? null) === $picoId) {
+                $p['last_seen'] = $now;
+                $p['active']    = true;
+                $found = true;
+                break;
+            }
         }
+        unset($p);
+        if (!$found) {
+            // Auto-enregistrement minimal si le Pico n'est pas encore déclaré
+            $picos[] = [
+                'pico_id'   => $picoId,
+                'nom'       => 'Pico ' . $picoId,
+                'ip'        => $_SERVER['REMOTE_ADDR'],
+                'active'    => true,
+                'last_seen' => $now,
+            ];
+        }
+        ftruncate($fp2, 0); rewind($fp2);
+        fwrite($fp2, json_encode($picos));
+        flock($fp2, LOCK_UN);
+        fclose($fp2);
     }
-
-    // Toujours écrire la trame brute dans data.json (pour debug)
-    file_put_contents($path, $json);
-    // Écrire le pic accumulé dans peak.json
-    $result = file_put_contents($peakPath, json_encode($peak));
-    error_log("[PICO] Pic courant : vitesse_kmh=" . $peak['vitesse_kmh'] . " swing=" . ($peak['swing_detecte']?'true':'false'));
 
     http_response_code(200);
     echo "OK";
     exit;
 }
 
-// ── 2. Requête AJAX du polling JS → retourne le PIC et le marque consommé
+// ── 2. Requête AJAX polling JS → retourne le pic si dans la fenêtre TTL ─────
+//    ?api=1&pico_id=X
+//    Tous les clients lisent le même pic sans se "voler" la donnée.
 if (isset($_GET['api'])) {
     header('Content-Type: application/json');
     header('Cache-Control: no-store');
 
-    $peak = ['vitesse_kmh' => 0, 'swing_detecte' => false];
-    if (file_exists($peakPath)) {
-        $p = json_decode(file_get_contents($peakPath), true);
-        if ($p) $peak = $p;
+    $picoId = max(0, intval($_GET['pico_id'] ?? 0));
+
+    // pico_id=0 → renvoie le pic le plus récent parmi tous les Picos actifs
+    if ($picoId === 0) {
+        $best = null;
+        foreach (glob(DATA_DIR . '/peak_*.json') as $f) {
+            $fp = fopen($f, 'r'); if (!$fp) continue;
+            flock($fp, LOCK_SH);
+            $raw = stream_get_contents($fp);
+            flock($fp, LOCK_UN); fclose($fp);
+            $p = json_decode($raw, true);
+            if (!is_array($p)) continue;
+            if (!empty($p['swing_detecte']) && time() < ($p['expires_at'] ?? 0)) {
+                if (!$best || $p['vitesse_kmh'] > $best['vitesse_kmh']) $best = $p;
+            }
+        }
+        echo json_encode($best ?? ['swing_detecte' => false, 'vitesse_kmh' => 0]);
+        exit;
     }
 
-    // Retourner le pic uniquement s'il n'a pas encore été consommé ET qu'un swing a été détecté
-    if (!empty($peak['swing_detecte']) && empty($peak['consumed'])) {
+    $peak = readPeakLocked($picoId, ['vitesse_kmh' => 0, 'swing_detecte' => false]);
+
+    // Le pic est valide uniquement si swing détecté ET dans la fenêtre TTL
+    if (!empty($peak['swing_detecte']) && time() < ($peak['expires_at'] ?? 0)) {
         echo json_encode($peak);
-        // Marquer comme consommé → le Pico pourra accumuler un nouveau pic
-        $peak['consumed'] = true;
-        $peak['swing_detecte'] = false;
-        file_put_contents($peakPath, json_encode($peak));
     } else {
         echo json_encode(['swing_detecte' => false, 'vitesse_kmh' => 0]);
     }
@@ -716,6 +823,48 @@ if (isset($_GET['clear_leaderboard']) && $_SERVER['REQUEST_METHOD'] === 'POST') 
   }
   .btn-primary:hover { background: rgba(196,98,45,0.32); }
 
+  /* ── Sélecteur Pico dans la topbar ── */
+  .pico-selector {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 4px 0 16px;
+    border-left: 1px solid rgba(196,98,45,0.2);
+  }
+  .pico-selector-lbl {
+    font-family: 'Bebas Neue', sans-serif;
+    font-size: 10px;
+    letter-spacing: 3px;
+    color: rgba(196,98,45,0.55);
+    white-space: nowrap;
+  }
+  #picoSelect {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(196,98,45,0.3);
+    color: #F0ECE4;
+    font-family: 'Barlow Condensed', sans-serif;
+    font-size: 13px;
+    letter-spacing: 1px;
+    padding: 4px 8px;
+    outline: none;
+    cursor: pointer;
+    max-width: 150px;
+    transition: border-color 0.15s;
+  }
+  #picoSelect:focus { border-color: rgba(196,98,45,0.7); }
+  #picoSelect option { background: #0A0806; color: #F0ECE4; }
+  .pico-selector-dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: rgba(255,255,255,0.12);
+    transition: background 0.4s, box-shadow 0.4s;
+    flex-shrink: 0;
+  }
+  .pico-selector-dot.live {
+    background: #3EC86A;
+    box-shadow: 0 0 7px #3EC86A;
+    animation: blink 1.4s ease-in-out infinite;
+  }
+
 </style>
 </head>
 <body>
@@ -746,6 +895,14 @@ if (isset($_GET['clear_leaderboard']) && $_SERVER['REQUEST_METHOD'] === 'POST') 
       <div class="brand-name">COURT <em>PHILIPPE-CHATRIER</em></div>
       <div class="brand-sub">Roland-Garros · Paris</div>
     </div>
+  </div>
+  <!-- Sélecteur de Pico actif -->
+  <div class="pico-selector" id="picoSelector">
+    <span class="pico-selector-lbl">CAPTEUR</span>
+    <select id="picoSelect" title="Choisir le Pico à surveiller">
+      <option value="0">Tous</option>
+    </select>
+    <span class="pico-selector-dot" id="picoSelectorDot"></span>
   </div>
 </div>
 
@@ -3260,32 +3417,90 @@ window.addEventListener('resize', onResize, { passive: true });
 
 animate(0);
 
-// ── POLLING CAPTEUR ────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+//  SÉLECTEUR DE PICO — peuple le <select> depuis l'API et gère le choix
+// ══════════════════════════════════════════════════════════════════════════
+let _selectedPicoId = 0;  // 0 = "Tous" (pic le plus récent parmi tous les Picos)
+
+const picoSelectEl  = document.getElementById('picoSelect');
+const picoSelectorDot = document.getElementById('picoSelectorDot');
+
+async function refreshPicoSelect() {
+  try {
+    const r = await fetch('?picos=1&_=' + Date.now());
+    const picos = await r.json();
+    // Conserver la sélection courante
+    const cur = picoSelectEl.value;
+    // Vider sauf "Tous"
+    while (picoSelectEl.options.length > 1) picoSelectEl.remove(1);
+    picos.forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.pico_id;
+      opt.textContent = (p.nom || ('Pico ' + p.pico_id)) + '  [P' + p.pico_id + ']';
+      picoSelectEl.appendChild(opt);
+    });
+    // Restaurer la sélection si elle existe encore
+    if ([...picoSelectEl.options].some(o => o.value == cur)) {
+      picoSelectEl.value = cur;
+    }
+    _selectedPicoId = parseInt(picoSelectEl.value) || 0;
+  } catch(e) {}
+}
+
+picoSelectEl.addEventListener('change', () => {
+  _selectedPicoId = parseInt(picoSelectEl.value) || 0;
+  picoSelectorDot.classList.remove('live');
+});
+
+// Charger la liste au démarrage puis la rafraîchir toutes les 10s
+refreshPicoSelect();
+setInterval(refreshPicoSelect, 10000);
+
+// ── POLLING CAPTEUR ─────────────────────────────────────────────────────────
 // Stratégie : polling rapide (150ms) pour ne pas rater le pic.
-// Le PHP accumule le maximum sur toute la durée du swing côté serveur,
-// donc même si on poll un peu après le pic, on récupère bien le MAX.
+// Le PHP accumule le maximum pendant PEAK_TTL secondes (modèle TTL).
+// TOUS les clients voient le même pic sans "consommation" destructive :
+//   → plusieurs navigateurs sur le même Pico reçoivent tous l'event.
+// ────────────────────────────────────────────────────────────────────────────
 let _polling = false;
-let _sessionBestKmh = 0;  // meilleur pic de la session
+let _sessionBestKmh = 0;
+let _lastTriggeredAt = 0;   // timestamp ms du dernier swing déclenché (dédoublonnage côté JS)
 
 setInterval(async () => {
-  if (_polling) return;   // éviter les requêtes qui se chevauchent
+  if (_polling) return;
   _polling = true;
   try {
-    const r = await fetch('?api=1&_=' + Date.now());
-    if (!r.ok) { return; }
+    // Toujours inclure le pico_id sélectionné (0 = tous)
+    const url = '?api=1&pico_id=' + _selectedPicoId + '&_=' + Date.now();
+    const r = await fetch(url);
+    if (!r.ok) return;
     const data = await r.json();
 
     if (data && data.swing_detecte && data.vitesse_kmh > 0) {
-      const kmh = parseFloat(data.vitesse_kmh);
-      if (kmh > _sessionBestKmh) _sessionBestKmh = kmh;
-      window.onSwingDetected(true, kmh);
+      // Dédoublonnage JS : le TTL fait que le serveur renvoie le même pic
+      // pendant plusieurs secondes. On ne déclenche l'animation qu'une seule
+      // fois par pic, identifié par (pico_id, expires_at).
+      const fingerprint = (data.pico_id || 0) + '_' + (data.expires_at || 0);
+      if (fingerprint !== _lastTriggeredAt) {
+        _lastTriggeredAt = fingerprint;
+        const kmh = parseFloat(data.vitesse_kmh);
+        if (kmh > _sessionBestKmh) { _sessionBestKmh = kmh; DOM.hBest.textContent = Math.round(_sessionBestKmh); }
+        _currentPicoId = data.pico_id || _selectedPicoId;
+        // Récupérer le nom du joueur depuis le sélecteur
+        const selOpt = [...picoSelectEl.options].find(o => o.value == _currentPicoId);
+        if (selOpt) _currentPlayerName = selOpt.textContent.replace(/\s*\[P\d+\]$/, '').trim();
+        // Indicateur visuel dans la topbar
+        picoSelectorDot.classList.add('live');
+        setTimeout(() => picoSelectorDot.classList.remove('live'), 3500);
+        window.onSwingDetected(true, kmh);
+      }
     }
   } catch(e) {
     // silencieux
   } finally {
     _polling = false;
   }
-}, 150);  // ← 150ms au lieu de 500ms
+}, 150);
 
 // ════════════════════════════════════════════════════════
 //  MENU BALLE DE TENNIS + LEADERBOARD + PICO MANAGER
@@ -3469,40 +3684,17 @@ document.getElementById('addPicoBtn').addEventListener('click', async () => {
     body: JSON.stringify({ pico_id: id, nom })
   });
   idEl.value = ''; nomEl.value = '';
-  loadPicos();
+  loadPicos();           // recharge le modal
+  refreshPicoSelect();   // recharge le sélecteur topbar
 });
 
-// Mettre le nom du joueur courant depuis le polling (pico_id reçu)
-const _origOnSwingDetected = window.onSwingDetected;
-window.onSwingDetected = async function(swingBool, speedKmh, picoId) {
-  if(picoId !== undefined) {
-    _currentPicoId = picoId;
-    // Récupérer le nom associé
-    try {
-      const r = await fetch('?picos=1&_='+Date.now());
-      const picos = await r.json();
-      const p = picos.find(x => x.pico_id === picoId);
-      if(p) _currentPlayerName = p.nom || 'Joueur';
-    } catch(e) {}
-  }
-  _origOnSwingDetected(swingBool, speedKmh);
+// ── Ajout rapide : rafraîchir aussi le sélecteur topbar après ajout/suppression ──
+// (loadPicos est appelé par les boutons existants ; on accroche refreshPicoSelect dessus)
+const _origLoadPicos = loadPicos;
+window.loadPicos = async function() {
+  await _origLoadPicos();
+  await refreshPicoSelect();
 };
-
-// Transmettre le pico_id depuis le polling
-const _origInterval = setInterval; // déjà lancé plus haut, on patch onSwingDetected dans le polling
-// Patch post-hoc : le polling appelle window.onSwingDetected(true, kmh) — on enrichit avec pico_id depuis data
-// (le polling existant passe déjà data.pico_id via la var data, on le récupère ici)
-// On redéfinit proprement l'appel dans le polling via un second patch :
-(function(){
-  // Le polling existant utilise window.onSwingDetected(true, kmh).
-  // On intercepte les données brutes depuis le flag global _lastPicoData.
-  const _origTrigger = triggerSwing;
-  window._patchedPicoId = 0;
-  window.triggerSwingWithPico = function(kmh, picoId) {
-    _currentPicoId = picoId || 0;
-    _origTrigger(kmh);
-  };
-})();
 
 </script>
 </body>
