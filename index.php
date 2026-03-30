@@ -850,6 +850,7 @@ if (isset($_GET['clear_leaderboard']) && $_SERVER['REQUEST_METHOD'] === 'POST') 
     cursor: pointer;
     max-width: 150px;
     transition: border-color 0.15s;
+    margin-right : 20px;
   }
   #picoSelect:focus { border-color: rgba(196,98,45,0.7); }
   #picoSelect option { background: #0A0806; color: #F0ECE4; }
